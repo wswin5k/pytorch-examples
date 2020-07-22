@@ -3,12 +3,18 @@ import argparse
 import time
 import math
 import os
+import sys
 import torch
 import torch.nn as nn
 import torch.onnx
+import torch.nn.parallel
+import torch.distributed
 
 import data
 import model
+import time
+
+start=time.time()
 
 parser = argparse.ArgumentParser(description='PyTorch Wikitext-2 RNN/LSTM Language Model')
 parser.add_argument('--data', type=str, default='./data/wikitext-2',
@@ -25,9 +31,9 @@ parser.add_argument('--lr', type=float, default=20,
                     help='initial learning rate')
 parser.add_argument('--clip', type=float, default=0.25,
                     help='gradient clipping')
-parser.add_argument('--epochs', type=int, default=40,
+parser.add_argument('--epochs', type=int, default=1,
                     help='upper epoch limit')
-parser.add_argument('--batch_size', type=int, default=20, metavar='N',
+parser.add_argument('--batch-size', type=int, default=32, metavar='N',
                     help='batch size')
 parser.add_argument('--bptt', type=int, default=35,
                     help='sequence length')
@@ -35,7 +41,7 @@ parser.add_argument('--dropout', type=float, default=0.2,
                     help='dropout applied to layers (0 = no dropout)')
 parser.add_argument('--tied', action='store_true',
                     help='tie the word embedding and softmax weights')
-parser.add_argument('--seed', type=int, default=1111,
+parser.add_argument('--seed', type=int, default=None,
                     help='random seed')
 parser.add_argument('--cuda', action='store_true',
                     help='use CUDA')
@@ -45,19 +51,30 @@ parser.add_argument('--save', type=str, default='model.pt',
                     help='path to save the final model')
 parser.add_argument('--onnx-export', type=str, default='',
                     help='path to export the final model in onnx format')
-
 parser.add_argument('--nhead', type=int, default=2,
                     help='the number of heads in the encoder/decoder of the transformer model')
 
+parser.add_argument('--dist-url', default=None, type=str,
+                    help='url used to set up distributed training')
+parser.add_argument('--world-size', default=1, type=int,
+                    help='number of nodes for distributed training')
+parser.add_argument('--rank', default=1, type=int,
+                    help='node rank for distributed training')
+
 args = parser.parse_args()
 
+if args.batch_size%args.world_size != 0:
+    print("batch size must be disivible by world size")
+    sys.exit(1)
+
 # Set the random seed manually for reproducibility.
-torch.manual_seed(args.seed)
+if args.seed:
+    torch.manual_seed(args.seed)
 if torch.cuda.is_available():
     if not args.cuda:
         print("WARNING: You have a CUDA device, so you should probably run with --cuda")
 
-device = torch.device("cuda" if args.cuda else "cpu")
+device = "cuda"# torch.device("cuda" if args.cuda else "cpu")
 
 ###############################################################################
 # Load data
@@ -87,7 +104,7 @@ def batchify(data, bsz):
     return data.to(device)
 
 eval_batch_size = 10
-train_data = batchify(corpus.train, args.batch_size)
+train_data = batchify(corpus.train, args.batch_size//args.world_size)
 val_data = batchify(corpus.valid, eval_batch_size)
 test_data = batchify(corpus.test, eval_batch_size)
 
@@ -100,6 +117,21 @@ if args.model == 'Transformer':
     model = model.TransformerModel(ntokens, args.emsize, args.nhead, args.nhid, args.nlayers, args.dropout).to(device)
 else:
     model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.tied).to(device)
+
+class DDPWrapper(nn.parallel.DistributedDataParallel):
+    def __init__(self, model):
+        super(DDPWrapper, self).__init__(model, bucket_cap_mb=1000)
+
+    def __getattr__(self, name):
+        try:
+            return super(DDPWrapper, self).__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
+
+if args.world_size != 1:
+    torch.distributed.init_process_group(backend='nccl', init_method=args.dist_url,
+                            world_size=args.world_size, rank=args.rank)
+    model = DDPWrapper(model)
 
 criterion = nn.CrossEntropyLoss()
 
@@ -160,8 +192,9 @@ def train():
     start_time = time.time()
     ntokens = len(corpus.dictionary)
     if args.model != 'Transformer':
-        hidden = model.init_hidden(args.batch_size)
-    for batch, i in enumerate(range(0, train_data.size(0) - 1, args.bptt)):
+        hidden = model.init_hidden(args.batch_size//args.world_size)
+    local_batches = range(args.rank*args.bptt, train_data.size(0) - 1, args.bptt*args.world_size)
+    for batch, i in enumerate(local_batches):
         data, targets = get_batch(train_data, i)
         # Starting each batch, we detach the hidden state from how it was previously produced.
         # If we didn't, the model would try backpropagating all the way to start of the dataset.
@@ -186,7 +219,7 @@ def train():
             elapsed = time.time() - start_time
             print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} | ms/batch {:5.2f} | '
                     'loss {:5.2f} | ppl {:8.2f}'.format(
-                epoch, batch, len(train_data) // args.bptt, lr,
+                epoch, batch, len(train_data) // (args.bptt*args.world_size), lr,
                 elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss)))
             total_loss = 0
             start_time = time.time()
@@ -217,7 +250,7 @@ try:
                                            val_loss, math.exp(val_loss)))
         print('-' * 89)
         # Save the model if the validation loss is the best we've seen so far.
-        if not best_val_loss or val_loss < best_val_loss:
+        if args.rank == 1 and (not best_val_loss or val_loss < best_val_loss):
             with open(args.save, 'wb') as f:
                 torch.save(model, f)
             best_val_loss = val_loss
@@ -228,22 +261,25 @@ except KeyboardInterrupt:
     print('-' * 89)
     print('Exiting from training early')
 
-# Load the best saved model.
-with open(args.save, 'rb') as f:
-    model = torch.load(f)
-    # after load the rnn params are not a continuous chunk of memory
-    # this makes them a continuous chunk, and will speed up forward pass
-    # Currently, only rnn model supports flatten_parameters function.
-    if args.model in ['RNN_TANH', 'RNN_RELU', 'LSTM', 'GRU']:
-        model.rnn.flatten_parameters()
+if args.rank == 1:
+    # Load the best saved model.
+    with open(args.save, 'rb') as f:
+        model = torch.load(f)
+        # after load the rnn params are not a continuous chunk of memory
+        # this makes them a continuous chunk, and will speed up forward pass
+        # Currently, only rnn model supports flatten_parameters function.
+        if args.model in ['RNN_TANH', 'RNN_RELU', 'LSTM', 'GRU']:
+            model.rnn.flatten_parameters()
 
-# Run on test data.
-test_loss = evaluate(test_data)
-print('=' * 89)
-print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
-    test_loss, math.exp(test_loss)))
-print('=' * 89)
+    # Run on test data.
+    test_loss = evaluate(test_data)
+    print('=' * 89)
+    print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
+        test_loss, math.exp(test_loss)))
+    print('=' * 89)
 
-if len(args.onnx_export) > 0:
-    # Export the model in ONNX format.
-    export_onnx(args.onnx_export, batch_size=1, seq_len=args.bptt)
+    if len(args.onnx_export) > 0:
+        # Export the model in ONNX format.
+        export_onnx(args.onnx_export, batch_size=1, seq_len=args.bptt)
+
+print("Training time: {}s".format(time.time()-start))
